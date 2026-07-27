@@ -2,6 +2,10 @@ import logging
 import asyncio
 import os
 import requests
+import json
+import urllib.request
+import urllib.parse
+import io
 from datetime import datetime
 from bs4 import BeautifulSoup
 import google.generativeai as genai
@@ -21,6 +25,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 OLLAMA_API_URL = "http://localhost:11434/v1/chat/completions"
 MODEL_NAME = "hf.co/HauhauCS/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP:Q4_K_M"
+
+# 🎨 ComfyUI 連携設定
+COMFYUI_SERVER = "127.0.0.1:8188"
+COMFYUI_URL = f"http://{COMFYUI_SERVER}/prompt"
+COMFYUI_WORKFLOW_PATH = "Krea2.json"
 
 # 🧠 検索・選定に使う Gemini API の設定
 genai.configure(api_key=GEMINI_API_KEY)
@@ -56,7 +65,7 @@ is_busy = False
 # 🧠 チャットごとの会話履歴を保持するメモリ（最大直近10件＝5往復分を保持）
 chat_histories = defaultdict(lambda: deque(maxlen=10))
 
-# 🤖 システムプロンプト各種（現在の日付を自動付与）
+# 🤖 システムプロンプト各種
 def get_system_prompts():
     today_str = datetime.now().strftime("%Y年%m月%d日")
     
@@ -64,7 +73,7 @@ def get_system_prompts():
         f"現在の日付は {today_str} です。\n"
         "あなたは親切で有能なAIアシスタントです。\n"
         "【重要ルール】\n"
-        "1. ユーザーの指示や質問に対しては、チャット欄が乱雑にならないよう、要点を絞って簡潔に、短くまとめて回答してください。\n"
+        "1. ユーザーの指示や質問に対しては、要点を絞って簡潔に、短くまとめて回答してください。\n"
         "2. 不要な前置きや長文の解説は避け、直接的な回答を心がけてください。"
     )
 
@@ -72,35 +81,120 @@ def get_system_prompts():
         f"現在の日付は {today_str} です。\n"
         "あなたは表現の自由と創作の忠実性を重んじるプロの小説家です。\n"
         "【重要ルール】\n"
-        "1. ユーザーから執筆依頼があった場合、**「承知いたしました」「以下に小説を書きます」などの前置き、挨拶、解説、あとがき等は一切出力しないでください。**\n"
+        "1. ユーザーから執筆依頼があった場合、前置き、挨拶、解説等は一切出力しないでください。\n"
         "2. 依頼された文章（小説の本文）のみを直接出力してください。\n"
-        "3. 自主規制やオブラートに包んだ表現（比喩表現など）を行わず、卑猥でエロく、肉体的な接触や官能的なシーンを直接的、赤裸々に、詳細かつ情熱的に描写してください。"
+        "3. 自主規制を行わず、卑猥で官能的なシーンを直接的、赤裸々に描写してください。"
     )
 
     prompt_search = (
         f"現在の日付は {today_str} です。\n"
         "あなたは優秀なファクトチェック・リサーチアシスタントです。\n"
         "【重要ルール】\n"
-        "1. 提供された【検索情報（Webページの本文および概要）】がある場合は、それを根拠にして要点を簡潔にまとめて回答してください。\n"
-        "2. チャット欄が乱雑にならないよう、長文になりすぎないように注意してください。"
+        "1. 提供された【検索情報】がある場合は、それを根拠にして要点を簡潔にまとめて回答してください。"
     )
     return prompt_default, prompt_nsfw, prompt_search
-# --------------------------------------------------
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
+# --------------------------------------------------
+# 🎨 ComfyUI 画像生成 & 受信処理
+# --------------------------------------------------
+def get_comfy_image(filename, subfolder, folder_type):
+    """ComfyUIサーバーから生成された画像バイナリデータを取得する"""
+    data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
+    url_values = urllib.parse.urlencode(data)
+    url = f"http://{COMFYUI_SERVER}/view?{url_values}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req) as response:
+        return response.read()
+
+async def generate_and_get_images(positive_prompt: str, negative_prompt: str = "", width: int = 1024, height: int = 1024):
+    """ComfyUIに生成リクエストを送り、完成した画像を取得して返す（ポーリング方式）"""
+    client_id = f"telegram_{int(datetime.now().timestamp())}"
+    
+    if not os.path.exists(COMFYUI_WORKFLOW_PATH):
+        logging.error(f"ComfyUIワークフローファイルが見つかりません: {COMFYUI_WORKFLOW_PATH}")
+        return None
+        
+    with open(COMFYUI_WORKFLOW_PATH, "r", encoding="utf-8") as f:
+        workflow_data = json.load(f)
+        
+    # ノード "4" (ポジティブプロンプト)
+    if "4" in workflow_data and "inputs" in workflow_data["4"]:
+        workflow_data["4"]["inputs"]["text"] = positive_prompt
+
+    # ノード "5" (ネガティブプロンプト)
+    if "5" in workflow_data and "inputs" in workflow_data["5"]:
+        workflow_data["5"]["inputs"]["text"] = negative_prompt
+
+    # ノード "6" (Empty Latent Image) のサイズを変更
+    if "6" in workflow_data and "inputs" in workflow_data["6"]:
+        workflow_data["6"]["inputs"]["width"] = width
+        workflow_data["6"]["inputs"]["height"] = height
+
+    p = {"prompt": workflow_data, "client_id": client_id}
+    data = json.dumps(p).encode('utf-8')
+    req = urllib.request.Request(COMFYUI_URL, data=data, headers={'Content-Type': 'application/json'})
+    
+    # 1. 画像生成リクエスト送信
+    try:
+        with urllib.request.urlopen(req) as response:
+            res = json.loads(response.read().decode('utf-8'))
+            prompt_id = res.get('prompt_id')
+    except Exception as e:
+        logging.error(f"ComfyUIリクエスト送信エラー: {e}")
+        return None
+
+    if not prompt_id:
+        return None
+
+    # 2. 履歴APIをポーリングして生成完了を監視（タイムアウト: 180秒）
+    start_time = datetime.now()
+    images_binary = []
+
+    while (datetime.now() - start_time).total_seconds() < 180:
+        try:
+            history_url = f"http://{COMFYUI_SERVER}/history/{prompt_id}"
+            def fetch_history():
+                with urllib.request.urlopen(history_url) as resp:
+                    return json.loads(resp.read().decode('utf-8'))
+            
+            history = await asyncio.to_thread(fetch_history)
+            
+            if prompt_id in history:
+                outputs = history[prompt_id].get('outputs', {})
+                if outputs:
+                    for node_id, node_output in outputs.items():
+                        if 'images' in node_output:
+                            for image_info in node_output['images']:
+                                img_data = await asyncio.to_thread(
+                                    get_comfy_image, 
+                                    image_info['filename'], 
+                                    image_info['subfolder'], 
+                                    image_info['type']
+                                )
+                                images_binary.append(img_data)
+                    break
+        except Exception:
+            pass
+            
+        await asyncio.sleep(2)
+
+    return images_binary if images_binary else None
+
+# --------------------------------------------------
+# 🔍 検索・Gemini関連
+# --------------------------------------------------
 async def search_duckduckgo_async(query: str, max_results: int = 5):
     return await asyncio.to_thread(search_duckduckgo_with_urls, query, max_results)
 
 def search_duckduckgo_with_urls(query: str, max_results: int = 5) -> list:
     try:
         url = "https://html.duckduckgo.com/html/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         data = {"q": query}
         response = requests.post(url, headers=headers, data=data, timeout=10)
         if response.status_code != 200:
@@ -113,7 +207,6 @@ def search_duckduckgo_with_urls(query: str, max_results: int = 5) -> list:
         for element in result_elements:
             if len(results) >= max_results:
                 break
-                
             title_tag = element.select_one(".result__title")
             snippet_tag = element.select_one(".result__snippet")
             link_tag = element.select_one(".result__url")
@@ -121,7 +214,6 @@ def search_duckduckgo_with_urls(query: str, max_results: int = 5) -> list:
             if title_tag and link_tag:
                 title = title_tag.get_text(strip=True)
                 snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
-                
                 raw_href = link_tag.get("href", "")
                 target_url = raw_href
                 if "uddg=" in raw_href:
@@ -131,11 +223,7 @@ def search_duckduckgo_with_urls(query: str, max_results: int = 5) -> list:
                     if "uddg" in query_params:
                         target_url = query_params["uddg"][0]
                 
-                results.append({
-                    "title": title,
-                    "snippet": snippet,
-                    "url": target_url
-                })
+                results.append({"title": title, "snippet": snippet, "url": target_url})
         return results
     except Exception as e:
         logging.error(f"DuckDuckGo検索エラー: {e}")
@@ -143,96 +231,65 @@ def search_duckduckgo_with_urls(query: str, max_results: int = 5) -> list:
 
 def scrape_page_text(url: str, max_chars: int = 3000) -> str:
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Encoding": "gzip, deflate"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
             return ""
-            
         soup = BeautifulSoup(response.text, "html.parser")
         for script in soup(["script", "style", "nav", "footer", "header"]):
             script.decompose()
-            
         text = soup.get_text(separator="\n", strip=True)
         return text[:max_chars]
     except Exception as e:
-        logging.error(f"ページスクレイピングエラー ({url}): {e}")
+        logging.error(f"スクレイピングエラー ({url}): {e}")
         return ""
 
 async def is_search_needed_async(user_text: str) -> bool:
     try:
         prompt = (
             f"現在の日付は {datetime.now().strftime('%Y年%m月%d日')} です。\n"
-            "以下のユーザーからの入力に対して、作品の概要, 人物, ゲームの設定や専門用語, 天気予報、最新情報の調査など、Web検索が必要かどうかを判断してください。\n"
-            "判断基準:\n"
-            "- 天気予報、漫画, アニメ, 映画, ゲーム, 固有名詞の詳細な設定、最新情報を調べる必要がある場合は 「YES」\n"
-            "- 検索が全く不要な場合は 「NO」\n\n"
-            f"入力: {user_text}\n"
-            "回答は 「YES」 または 「NO」 のみで出力してください。"
+            "以下の入力に対してWeb検索が必要か判断してください。「YES」または「NO」のみで回答。\n"
+            f"入力: {user_text}"
         )
         response = await router_model.generate_content_async(prompt)
-        answer = response.text.strip().upper()
-        print(f"🧠 [Gemini 検索判定]: {answer} (入力: {user_text})")
-        return "YES" in answer
+        return "YES" in response.text.strip().upper()
     except Exception as e:
-        logging.error(f"Gemini 判定エラー: {e}")
         return False
 
 async def is_nsfw_writing_request_async(user_text: str, replied_text: str = "") -> bool:
     try:
         context_hint = f"\n直近の文脈: {replied_text}" if replied_text else ""
         prompt = (
-            "以下のユーザーからの入力（および直近の文脈）が、官能小説、アダルトな物語、性的な描写を含む創作・文章の執筆、またはその続きを書く依頼に該当するかどうかを判断してください。\n"
-            f"入力: {user_text}"
-            f"{context_hint}\n"
-            "該当する場合は 「YES」、そうでない場合は 「NO」 のみで出力してください。"
+            "以下の入力が官能小説やアダルト文章の創作に該当するか判断してください。「YES」または「NO」のみで回答。\n"
+            f"入力: {user_text}{context_hint}"
         )
         response = await router_model.generate_content_async(prompt)
-        answer = response.text.strip().upper()
-        print(f"🔞 [Gemini 創作判定]: {answer}")
-        return "YES" in answer
+        return "YES" in response.text.strip().upper()
     except Exception as e:
-        logging.error(f"Gemini 創作判定エラー (セーフティブロック検知): {e}")
-        print("🔞 [Gemini 創作判定 救済措置]: ブロックによる例外発生のため、NSFW（官能・アダルト）として扱います")
         return True
 
 async def select_best_url_and_gather_data_async(user_text: str, search_results: list) -> str:
-    snippets_text = "【検索結果の概要一覧】\n"
+    snippets_text = "【検索結果概要】\n"
     for i, res in enumerate(search_results):
-        snippets_text += f"{i+1}. タイトル: {res['title']}\n   URL: {res['url']}\n   概要: {res['snippet']}\n"
-
+        snippets_text += f"{i+1}. {res['title']}\n   {res['url']}\n   {res['snippet']}\n"
     try:
-        options_text = ""
-        for i, res in enumerate(search_results):
-            options_text += f"[{i+1}] タイトル: {res['title']}\nURL: {res['url']}\n概要: {res['snippet']}\n\n"
-            
-        prompt = (
-            f"ユーザーの要望: 「{user_text}」\n\n"
-            "上記の要望に登場する用語や世界観を把握するために最も詳しく情報が載っていそうなURLの番号（1〜5の数字）を1つだけ選んでください。\n"
-            "番号の数字（例: 1）のみを答えてください。"
-        )
-        response = await router_model.generate_content_async(prompt + "\n\n" + options_text)
-        answer = response.text.strip()
-        
+        prompt = f"ユーザー要望: 「{user_text}」\n最も詳しい情報が載っているURLの番号(1〜5)を1つだけ選んでください。"
+        response = await router_model.generate_content_async(prompt + "\n\n" + snippets_text)
         import re
-        match = re.search(r'\d+', answer)
+        match = re.search(r'\d+', response.text.strip())
         if match:
             idx = int(match.group()) - 1
             if 0 <= idx < len(search_results):
-                selected_url = search_results[idx]['url']
-                print(f"🎯 [Gemini URL選定]: 番号 {idx+1} -> {selected_url}")
-                
-                page_text = await asyncio.to_thread(scrape_page_text, selected_url)
+                page_text = await asyncio.to_thread(scrape_page_text, search_results[idx]['url'])
                 if page_text and len(page_text.strip()) > 100:
-                    combined = f"【Webページの本文データ (URL: {selected_url})】\n{page_text}\n\n{snippets_text}"
-                    return combined
+                    return f"【本文データ】\n{page_text}\n\n{snippets_text}"
     except Exception as e:
-        logging.error(f"Gemini URL選定エラー: {e}")
-    
+        logging.error(f"URL選定エラー: {e}")
     return snippets_text
 
+# --------------------------------------------------
+# 💬 メッセージ処理メイン
+# --------------------------------------------------
 async def process_single_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message or not update.message.text:
@@ -249,6 +306,83 @@ async def process_single_message(update: Update, context: ContextTypes.DEFAULT_T
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
+        # 🎨 "img:" または "生成:" で始まっている場合の画像生成処理
+        if clean_text.startswith("img:") or clean_text.startswith("生成:"):
+            body = clean_text.replace("img:", "", 1).replace("生成:", "", 1).strip()
+            
+            if not body:
+                usage_text = (
+                    "🎨 **ComfyUI 画像生成の使い方**\n\n"
+                    "• スクエア (1024x1024):\n  `img: 1girl, cat ears`\n\n"
+                    "• ネガティブ指定:\n  `img: 1girl / blurry`\n\n"
+                    "• サイズ指定（3番目に v, h, s を指定）:\n"
+                    "  `img: 1girl / / v` （縦長：896x1152）\n"
+                    "  `img: 1girl / / h` （横長：1152x896）\n"
+                    "  `img: 1girl / blurry / s` （スクエア：1024x1024）"
+                )
+                await update.message.reply_text(usage_text, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
+                return
+
+            positive_prompt = ""
+            negative_prompt = ""
+            size_mode = "s"  # デフォルトはスクエア
+
+            # スラッシュで分割 (最大3パート: [ポジティブ, ネガティブ, サイズ])
+            parts = [p.strip() for p in body.split("/")]
+            
+            if len(parts) >= 1:
+                positive_prompt = parts[0]
+            if len(parts) >= 2:
+                negative_prompt = parts[1]
+            if len(parts) >= 3 and parts[2]:
+                size_mode = parts[2].lower()
+
+            # サイズモードに応じた解像度の割り当て（指定なし・未入力の場合はスクエア）
+            width, height = 1024, 1024
+            size_desc = "スクエア (1024x1024)"
+            
+            if size_mode == "v":
+                width, height = 896, 1152
+                size_desc = "縦長 (896x1152)"
+            elif size_mode == "h":
+                width, height = 1152, 896
+                size_desc = "横長 (1152x896)"
+            elif size_mode == "s":
+                width, height = 1024, 1024
+                size_desc = "スクエア (1024x1024)"
+
+            status_msg = await update.message.reply_text(
+                f"🎨 画像を生成中です...少々お待ちください。\n"
+                f"👍 ポジティブ: {positive_prompt}\n"
+                f"👎 ネガティブ: {negative_prompt if negative_prompt else '(なし)'}\n"
+                f"📐 サイズ: {size_desc}",
+                reply_to_message_id=update.message.message_id
+            )
+
+            # 画像生成とダウンロードを実行（サイズを渡す）
+            images = await generate_and_get_images(positive_prompt, negative_prompt, width, height)
+
+            if images:
+                await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+                for img_bytes in images:
+                    bio = io.BytesIO(img_bytes)
+                    bio.name = 'image.png'  # Telegramが画像として正しく認識するためのファイル名指定
+                    
+                    # 全ての画像を強制的にスポイラー付き（has_spoiler=True）で送信
+                    await update.message.reply_photo(
+                        photo=bio,
+                        caption=f"✨ 生成完了! ({size_desc})\nPrompt: {positive_prompt}",
+                        reply_to_message_id=update.message.message_id,
+                        has_spoiler=True,
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60
+                    )
+            else:
+                await update.message.reply_text("❌ 画像の生成または取得に失敗しました。ComfyUIが起動しているか確認してください。", reply_to_message_id=update.message.message_id)
+            return
+
+        # ―― 通常のチャット処理 ――
         history = chat_histories[chat_id]
         combined_context_text = " ".join([item["content"] for item in history]) + " " + clean_text
 
@@ -262,21 +396,13 @@ async def process_single_message(update: Update, context: ContextTypes.DEFAULT_T
                 search_context = await select_best_url_and_gather_data_async(clean_text, search_results)
 
         prompt_default, prompt_nsfw, prompt_search = get_system_prompts()
-        if is_nsfw:
-            system_instruction = prompt_nsfw
-        else:
-            system_instruction = prompt_search if needs_search else prompt_default
+        system_instruction = prompt_nsfw if is_nsfw else (prompt_search if needs_search else prompt_default)
 
-        if search_context:
-            final_user_content = f"{search_context}\n\n上記の設定や背景知識も参考にしながら、要点を簡潔に（創作の場合は本文のみを）回答してください。\n要望: {clean_text}"
-        else:
-            final_user_content = clean_text
+        final_user_content = f"{search_context}\n\n要望: {clean_text}" if search_context else clean_text
 
         messages_payload = [{"role": "system", "content": system_instruction}]
-
         for hist in history:
             messages_payload.append({"role": hist["role"], "content": hist["content"]})
-
         messages_payload.append({"role": "user", "content": final_user_content})
 
         payload = {
@@ -291,16 +417,14 @@ async def process_single_message(update: Update, context: ContextTypes.DEFAULT_T
         response = await asyncio.to_thread(call_ollama)
         if response.status_code == 200:
             ai_reply = response.json()['choices'][0]['message']['content']
-            
             history.append({"role": "user", "content": clean_text})
             history.append({"role": "assistant", "content": ai_reply})
-
             await update.message.reply_text(ai_reply, reply_to_message_id=update.message.message_id)
         else:
             await update.message.reply_text(f"APIエラー: Status {response.status_code}")
             
     except Exception as e:
-        await update.message.reply_text(f"接続エラー: {str(e)}")
+        await update.message.reply_text(f"エラーが発生しました: {str(e)}")
 
 async def queue_worker():
     global is_busy
@@ -318,7 +442,6 @@ async def queue_worker():
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logging.error(f"キューワーカー外側エラー: {e}")
             is_busy = False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,15 +461,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.message.reply_to_message.from_user.is_bot and 
             context.bot.id == update.message.reply_to_message.from_user.id
         )
-        
         if not is_mentioned and not is_reply_to_bot:
             return
 
     if is_busy:
-        await update.message.reply_text(
-            "現在、別件の処理中です。恐れ入りますが、少し待ってから再度リクエストをお願いします。",
-            reply_to_message_id=update.message.message_id
-        )
+        await update.message.reply_text("現在、別の処理を実行中です。完了まで少しお待ちください。", reply_to_message_id=update.message.message_id)
         return
 
     await message_queue.put((update, context))
@@ -358,9 +477,8 @@ if __name__ == '__main__':
         global message_queue
         message_queue = asyncio.Queue()
         application.create_task(queue_worker())
-        print("Telegram Bot (現在日付自動付与版) 起動中...")
+        print("Telegram Bot (サイズ補完・アナウンス対応版) 起動完了!")
 
     app.post_init = post_init
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
     app.run_polling()
